@@ -25,7 +25,13 @@ async function request<T>(
 export const api = {
   // Orders
   getOrders: (merchantId: number, page = 1, perPage = 50) =>
-    request<Order[]>(`/orders?merchant_id=${merchantId}&page=${page}&per_page=${perPage}`),
+    request<{
+      orders: Order[]
+      total: number
+      page: number
+      per_page: number
+      total_pages: number
+    }>(`/orders?merchant_id=${merchantId}&page=${page}&per_page=${perPage}`),
 
   createOrder: (data: {
     merchant_id: number

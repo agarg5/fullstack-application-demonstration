@@ -307,7 +307,9 @@ pytest test_app.py::TestOrderCreation::test_create_order_with_valid_data
 
 ### Test Coverage
 
-The test suite includes:
+#### Backend Tests
+
+The backend test suite includes:
 
 - **Order Creation**: Valid data, missing fields, time validation, auto-assignment
 - **Order Updates**: Merchant authorization, status checks, re-assignment logic
@@ -316,3 +318,37 @@ The test suite includes:
 - **Driver Endpoints**: Driver listing with shifts
 - **Validation**: Time constraints, weight limits
 - **Driver Assignment**: Shift availability, capacity checks
+
+#### Frontend Tests
+
+The frontend test suite includes:
+
+- **CSV Upload**: File selection, type selection, upload success/error handling
+- **Orders Page**: Rendering, order display, dialog interactions
+
+### Running Frontend Tests
+
+```bash
+cd frontend
+npm install  # Install test dependencies
+npm test     # Run tests in watch mode
+npm run test:ui  # Run tests with UI
+npm run test:coverage  # Run tests with coverage report
+```
+
+### Manual Testing with CSV Files
+
+Test CSV files are available in `frontend/test-data/`:
+
+- `test_merchants.csv` - Sample merchants
+- `test_drivers.csv` - Sample drivers
+- `test_vehicles.csv` - Sample vehicles (requires drivers first)
+- `test_orders.csv` - Sample orders (requires merchants first)
+
+**To test manually:**
+1. Navigate to the Upload CSV page
+2. Select a data type
+3. Upload the corresponding test CSV file
+4. Verify the data appears in the respective pages
+
+**Note:** Upload merchants and drivers before vehicles and orders due to foreign key constraints.

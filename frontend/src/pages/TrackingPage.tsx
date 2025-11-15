@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { MapContainer, TileLayer, Marker, Popup } from 'react-leaflet'
+import { io } from 'socket.io-client'
 import type { LocationUpdate } from '../types'
 import 'leaflet/dist/leaflet.css'
 import L from 'leaflet'
@@ -18,49 +19,36 @@ export default function TrackingPage() {
   const [connected, setConnected] = useState(false)
 
   useEffect(() => {
-    // Connect to WebSocket
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${protocol}//${window.location.hostname}:8000/ws/tracking`
+    // Connect to Socket.IO server
+    const socket = io('http://localhost:8000', {
+      transports: ['websocket', 'polling']
+    })
 
-    const ws = new WebSocket(wsUrl)
-    wsRef.current = ws
-
-    ws.onopen = () => {
+    socket.on('connect', () => {
       console.log('WebSocket connected')
       setConnected(true)
-    }
+    })
 
-    ws.onmessage = (event) => {
-      try {
-        const update: LocationUpdate = JSON.parse(event.data)
-        setLocations((prev) => {
-          const newMap = new Map(prev)
-          newMap.set(update.driver_id, update)
-          return newMap
-        })
-      } catch (err) {
-        console.error('Failed to parse WebSocket message:', err)
-      }
-    }
+    socket.on('location_update', (update: LocationUpdate) => {
+      setLocations((prev) => {
+        const newMap = new Map(prev)
+        newMap.set(update.driver_id, update)
+        return newMap
+      })
+    })
 
-    ws.onerror = (error) => {
-      console.error('WebSocket error:', error)
-      setConnected(false)
-    }
-
-    ws.onclose = () => {
+    socket.on('disconnect', () => {
       console.log('WebSocket disconnected')
       setConnected(false)
-      // Reconnect after 3 seconds
-      setTimeout(() => {
-        if (wsRef.current?.readyState === WebSocket.CLOSED) {
-          // Reconnect logic would go here
-        }
-      }, 3000)
-    }
+    })
+
+    socket.on('connect_error', (error) => {
+      console.error('WebSocket connection error:', error)
+      setConnected(false)
+    })
 
     return () => {
-      ws.close()
+      socket.disconnect()
     }
   }, [])
 

@@ -1,0 +1,9 @@
+id,merchant_id,driver_id,vehicle_id,status,description,pickup_time,dropoff_time,weight
+401,1,,,pending,Electronics Delivery - Laptop and accessories package,2025-01-20T10:00:00,2025-01-20T12:00:00,50.5
+402,1,,,pending,Books Shipment - Educational materials for school library,2025-01-20T14:00:00,2025-01-20T16:00:00,75.0
+403,1,,,pending,Furniture Delivery - Office desk and ergonomic chair set,2025-01-21T09:00:00,2025-01-21T11:00:00,100.0
+404,1,,,pending,Clothing Order - Winter collection items and accessories,2025-01-21T13:00:00,2025-01-21T15:00:00,45.0
+405,1,,,pending,Food Delivery - Restaurant supplies bulk order,2025-01-22T08:00:00,2025-01-22T10:00:00,120.5
+406,1,,,pending,Medical Supplies - First aid kits and equipment,2025-01-22T11:00:00,2025-01-22T13:00:00,85.0
+407,1,,,pending,Pet Supplies - Dog food and accessories bulk order,2025-01-23T09:00:00,2025-01-23T11:00:00,60.0
+

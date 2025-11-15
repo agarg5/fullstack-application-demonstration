@@ -1,12 +1,16 @@
 import os
 import sqlite3
 import threading
+import random
+import time
 from datetime import datetime, timedelta, time as dt_time
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
 CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Database configuration
 # Default to ../data/database.db relative to backend folder
@@ -252,6 +256,22 @@ def get_drivers():
     return jsonify(result)
 
 
+# ==================== SHIFTS ====================
+
+@app.route('/shifts', methods=['GET'])
+def get_shifts():
+    """Get all shifts."""
+    conn = get_db_connection()
+    shifts = conn.execute('''
+        SELECT s.*, d.name as driver_name
+        FROM shifts s
+        LEFT JOIN drivers d ON s.driver_id = d.id
+        ORDER BY s.shift_date, s.start_time
+    ''').fetchall()
+    conn.close()
+    return jsonify([dict(shift) for shift in shifts])
+
+
 # ==================== ORDERS ====================
 
 
@@ -272,19 +292,44 @@ def get_orders():
         'SELECT COUNT(*) as count FROM orders WHERE merchant_id = ?',
         (merchant_id,)).fetchone()['count']
 
-    # Get paginated orders
+    # Get paginated orders with all required fields
     offset = (page - 1) * per_page
     orders = conn.execute('''
-        SELECT id as order_id, status, driver_id, pickup_time, dropoff_time
-        FROM orders
-        WHERE merchant_id = ?
-        ORDER BY created_at DESC
+        SELECT o.id as order_id, o.merchant_id, o.status, o.driver_id,
+               o.description, o.pickup_time, o.dropoff_time, o.weight,
+               d.name as driver_name
+        FROM orders o
+        LEFT JOIN drivers d ON o.driver_id = d.id
+        WHERE o.merchant_id = ?
+        ORDER BY o.created_at DESC
         LIMIT ? OFFSET ?
     ''', (merchant_id, per_page, offset)).fetchall()
 
     conn.close()
 
-    return jsonify([dict(order) for order in orders])
+    # Format the response to match frontend expectations
+    formatted_orders = []
+    for order in orders:
+        order_dict = dict(order)
+        formatted_order = {
+            'order_id': order_dict['order_id'],
+            'merchant_id': order_dict['merchant_id'],
+            'status': order_dict['status'],
+            'driver_id': order_dict['driver_id'],
+            'description': order_dict['description'],
+            'pickup_time': order_dict['pickup_time'],
+            'dropoff_time': order_dict['dropoff_time'],
+            'weight': order_dict['weight'],
+        }
+        # Add driver object if driver exists
+        if order_dict['driver_id'] and order_dict['driver_name']:
+            formatted_order['driver'] = {
+                'id': order_dict['driver_id'],
+                'name': order_dict['driver_name']
+            }
+        formatted_orders.append(formatted_order)
+
+    return jsonify(formatted_orders)
 
 
 @app.route('/orders', methods=['POST'])
@@ -556,6 +601,107 @@ def delete_order(order_id):
 # ==================== OTHER ENDPOINTS (for admin/internal use) ====================
 
 
+@app.route('/upload', methods=['POST'])
+def upload_csv():
+    """Upload and process CSV file."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files['file']
+    csv_type = request.form.get('type')
+
+    if file.filename == '':
+        return jsonify({"error": "No file selected"}), 400
+
+    if not csv_type or csv_type not in ['merchants', 'drivers', 'vehicles', 'orders']:
+        return jsonify({"error": "Invalid CSV type"}), 400
+
+    if not file.filename.endswith('.csv'):
+        return jsonify({"error": "File must be a CSV"}), 400
+
+    try:
+        import csv
+        import io
+
+        # Read CSV content
+        stream = io.StringIO(file.stream.read().decode("UTF8"), newline=None)
+        csv_reader = csv.DictReader(stream)
+
+        conn = get_db_connection()
+        count = 0
+        errors = []
+
+        if csv_type == 'merchants':
+            for row in csv_reader:
+                try:
+                    conn.execute(
+                        'INSERT OR IGNORE INTO merchants (id, name, email) VALUES (?, ?, ?)',
+                        (row['id'], row['name'], row['email'])
+                    )
+                    count += 1
+                except Exception as e:
+                    errors.append(f"Row {count + 1}: {str(e)}")
+
+        elif csv_type == 'drivers':
+            for row in csv_reader:
+                try:
+                    conn.execute(
+                        'INSERT OR IGNORE INTO drivers (id, name) VALUES (?, ?)',
+                        (row['id'], row['name'])
+                    )
+                    count += 1
+                except Exception as e:
+                    errors.append(f"Row {count + 1}: {str(e)}")
+
+        elif csv_type == 'vehicles':
+            for row in csv_reader:
+                try:
+                    conn.execute(
+                        'INSERT OR IGNORE INTO vehicles (id, driver_id, max_orders, max_weight) VALUES (?, ?, ?, ?)',
+                        (row['id'], row['driver_id'],
+                         row['max_orders'], row['max_weight'])
+                    )
+                    count += 1
+                except Exception as e:
+                    errors.append(f"Row {count + 1}: {str(e)}")
+
+        elif csv_type == 'orders':
+            for row in csv_reader:
+                try:
+                    driver_id = row.get('driver_id') if row.get(
+                        'driver_id') else None
+                    vehicle_id = row.get('vehicle_id') if row.get(
+                        'vehicle_id') else None
+                    description = row.get('description', '')
+
+                    conn.execute(
+                        'INSERT OR IGNORE INTO orders (id, merchant_id, driver_id, vehicle_id, status, description, pickup_time, dropoff_time, weight) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        (row['id'], row['merchant_id'], driver_id, vehicle_id,
+                         row.get('status', 'pending'), description,
+                         row['pickup_time'], row['dropoff_time'], row['weight'])
+                    )
+                    count += 1
+                except Exception as e:
+                    errors.append(f"Row {count + 1}: {str(e)}")
+
+        conn.commit()
+        conn.close()
+
+        if errors:
+            return jsonify({
+                "message": f"Uploaded {count} {csv_type} with {len(errors)} errors",
+                "errors": errors[:10]  # Limit to first 10 errors
+            }), 207  # 207 Multi-Status
+
+        return jsonify({
+            "message": f"Successfully uploaded {count} {csv_type}",
+            "count": count
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": f"Failed to process CSV: {str(e)}"}), 500
+
+
 @app.route('/')
 def home():
     """Health check endpoint."""
@@ -598,10 +744,66 @@ def create_merchant():
         return jsonify({"error": "Merchant with this name or email already exists"}), 400
 
 
+# ==================== WEBSOCKET TRACKING ====================
+
+def generate_fake_location():
+    """Generate fake driver locations for tracking."""
+    conn = get_db_connection()
+    drivers = conn.execute('SELECT id, name FROM drivers').fetchall()
+    conn.close()
+
+    if not drivers:
+        return
+
+    # Generate fake locations for each driver
+    for driver in drivers:
+        # Random location around NYC area
+        latitude = 40.7128 + random.uniform(-0.1, 0.1)
+        longitude = -74.0060 + random.uniform(-0.1, 0.1)
+
+        location_update = {
+            'driver_id': driver['id'],
+            'driver_name': driver['name'],
+            'latitude': round(latitude, 6),
+            'longitude': round(longitude, 6),
+            'timestamp': datetime.now().isoformat()
+        }
+
+        socketio.emit('location_update', location_update)
+
+
+@socketio.on('connect')
+def handle_connect():
+    """Handle WebSocket connection."""
+    print('Client connected to WebSocket')
+    emit('connected', {'message': 'Connected to tracking server'})
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle WebSocket disconnection."""
+    print('Client disconnected from WebSocket')
+
+
+def start_location_updates():
+    """Start sending fake location updates every few seconds."""
+    def send_updates():
+        while True:
+            generate_fake_location()
+            time.sleep(5)  # Send updates every 5 seconds
+
+    thread = threading.Thread(target=send_updates, daemon=True)
+    thread.start()
+
+
 if __name__ == '__main__':
     # Initialize database on startup
     init_db()
     print(f"Database initialized at: {DATABASE_PATH}")
 
-    # Run the Flask app
-    app.run(host='0.0.0.0', port=8000, debug=True)
+    # Start fake location updates
+    start_location_updates()
+    print("Location tracking started (sending updates every 5 seconds)")
+
+    # Run the Flask app with SocketIO
+    socketio.run(app, host='0.0.0.0', port=8000, debug=True)
