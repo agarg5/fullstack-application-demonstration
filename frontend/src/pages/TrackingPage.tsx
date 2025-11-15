@@ -1,0 +1,151 @@
+import { useState, useEffect, useRef } from 'react'
+import { MapContainer, TileLayer, Marker, Popup } from 'react-leaflet'
+import type { LocationUpdate } from '../types'
+import 'leaflet/dist/leaflet.css'
+import L from 'leaflet'
+
+// Fix for default marker icon
+delete (L.Icon.Default.prototype as any)._getIconUrl
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon-2x.png',
+  iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon.png',
+  shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png',
+})
+
+export default function TrackingPage() {
+  const [locations, setLocations] = useState<Map<number, LocationUpdate>>(new Map())
+  const wsRef = useRef<WebSocket | null>(null)
+  const [connected, setConnected] = useState(false)
+
+  useEffect(() => {
+    // Connect to WebSocket
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const wsUrl = `${protocol}//${window.location.hostname}:8000/ws/tracking`
+    
+    const ws = new WebSocket(wsUrl)
+    wsRef.current = ws
+
+    ws.onopen = () => {
+      console.log('WebSocket connected')
+      setConnected(true)
+    }
+
+    ws.onmessage = (event) => {
+      try {
+        const update: LocationUpdate = JSON.parse(event.data)
+        setLocations((prev) => {
+          const newMap = new Map(prev)
+          newMap.set(update.driver_id, update)
+          return newMap
+        })
+      } catch (err) {
+        console.error('Failed to parse WebSocket message:', err)
+      }
+    }
+
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error)
+      setConnected(false)
+    }
+
+    ws.onclose = () => {
+      console.log('WebSocket disconnected')
+      setConnected(false)
+      // Reconnect after 3 seconds
+      setTimeout(() => {
+        if (wsRef.current?.readyState === WebSocket.CLOSED) {
+          // Reconnect logic would go here
+        }
+      }, 3000)
+    }
+
+    return () => {
+      ws.close()
+    }
+  }, [])
+
+  const locationArray = Array.from(locations.values())
+  const center: [number, number] = locationArray.length > 0
+    ? [locationArray[0].latitude, locationArray[0].longitude]
+    : [40.7128, -74.0060] // Default to NYC
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <h1 className="text-3xl font-bold">Order Tracking</h1>
+        <div className="flex items-center gap-2">
+          <div
+            className={`h-3 w-3 rounded-full ${
+              connected ? 'bg-green-500' : 'bg-red-500'
+            }`}
+          />
+          <span className="text-sm text-muted-foreground">
+            {connected ? 'Connected' : 'Disconnected'}
+          </span>
+        </div>
+      </div>
+
+      <div className="rounded-md border">
+        <div className="h-[600px] w-full">
+          <MapContainer
+            center={center}
+            zoom={13}
+            style={{ height: '100%', width: '100%' }}
+          >
+            <TileLayer
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            />
+            {locationArray.map((location) => (
+              <Marker
+                key={location.driver_id}
+                position={[location.latitude, location.longitude]}
+              >
+                <Popup>
+                  <div>
+                    <div className="font-semibold">{location.driver_name}</div>
+                    <div className="text-sm text-muted-foreground">
+                      Driver ID: {location.driver_id}
+                    </div>
+                    <div className="text-sm text-muted-foreground">
+                      Updated: {new Date(location.timestamp).toLocaleTimeString()}
+                    </div>
+                  </div>
+                </Popup>
+              </Marker>
+            ))}
+          </MapContainer>
+        </div>
+      </div>
+
+      <div className="rounded-md border p-4">
+        <h2 className="mb-4 text-lg font-semibold">Active Drivers</h2>
+        {locationArray.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No active drivers at the moment
+          </p>
+        ) : (
+          <div className="space-y-2">
+            {locationArray.map((location) => (
+              <div
+                key={location.driver_id}
+                className="flex items-center justify-between rounded border p-2"
+              >
+                <div>
+                  <div className="font-medium">{location.driver_name}</div>
+                  <div className="text-sm text-muted-foreground">
+                    {location.latitude.toFixed(4)}, {location.longitude.toFixed(4)}
+                  </div>
+                </div>
+                <div className="text-sm text-muted-foreground">
+                  {new Date(location.timestamp).toLocaleTimeString()}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
