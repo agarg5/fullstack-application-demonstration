@@ -171,6 +171,8 @@ export default function OrdersPage() {
       setIsDialogOpen(false);
       // Reset to page 1 to see the new/updated order
       setPage(1);
+      // Explicitly reload orders so changes are visible immediately
+      await loadOrders();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to save order");
     }
