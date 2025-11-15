@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import ReactPaginate from "react-paginate";
 import { api, getAuth } from "../api/client";
-import type { Order, Merchant } from "../types";
+import type { Order } from "../types";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import {
@@ -40,9 +40,9 @@ const STATUS_COLORS = {
 export default function OrdersPage() {
   const auth = getAuth();
 
+  const merchantId = auth?.merchant.id ?? null;
+
   const [orders, setOrders] = useState<Order[]>([]);
-  const [merchants, setMerchants] = useState<Merchant[]>([]);
-  const [selectedMerchant, setSelectedMerchant] = useState<number | null>(auth?.merchant.id ?? null);
   const [page, setPage] = useState(1);
   const [perPage] = useState(20);
   const [total, setTotal] = useState(0);
@@ -63,10 +63,6 @@ export default function OrdersPage() {
     weight: "",
   });
 
-  useEffect(() => {
-    loadMerchants();
-  }, []);
-
   // Debounce search term to avoid too many API calls
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -77,38 +73,23 @@ export default function OrdersPage() {
   }, [searchTerm]);
 
   useEffect(() => {
-    if (selectedMerchant) {
-      setPage(1); // Reset to page 1 when merchant or search changes
-    }
-  }, [selectedMerchant, debouncedSearchTerm]);
+    setPage(1); // Reset to page 1 when search changes
+  }, [debouncedSearchTerm]);
 
   useEffect(() => {
-    if (selectedMerchant) {
+    if (merchantId) {
       loadOrders();
     }
-  }, [selectedMerchant, page, debouncedSearchTerm]);
-
-  const loadMerchants = async () => {
-    try {
-      const data = await api.getMerchants();
-      setMerchants(data);
-      // Prefer the logged-in merchant if not already selected
-      if (!selectedMerchant && auth?.merchant.id) {
-        setSelectedMerchant(auth.merchant.id);
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load merchants");
-    }
-  };
+  }, [merchantId, page, debouncedSearchTerm]);
 
   const loadOrders = async () => {
-    if (!selectedMerchant) return;
+    if (!merchantId) return;
     setLoading(true);
     try {
       // Only send search if there's a search term
       const searchQuery = debouncedSearchTerm.trim() || undefined;
       const response = await api.getOrders(
-        selectedMerchant,
+        merchantId,
         page,
         perPage,
         searchQuery
@@ -150,7 +131,10 @@ export default function OrdersPage() {
   };
 
   const handleSubmit = async () => {
-    if (!selectedMerchant) return;
+    if (!merchantId) {
+      setError("No merchant selected.");
+      return;
+    }
 
     setError(null);
     setSuccess(null);
@@ -158,14 +142,14 @@ export default function OrdersPage() {
     try {
       if (editingOrder) {
         await api.updateOrder(editingOrder.order_id, {
-          merchant_id: selectedMerchant,
+          merchant_id: merchantId,
           ...formData,
           weight: parseFloat(formData.weight),
         });
         setSuccess("Order updated successfully");
       } else {
         await api.createOrder({
-          merchant_id: selectedMerchant,
+          merchant_id: merchantId,
           ...formData,
           weight: parseFloat(formData.weight),
         });
@@ -192,7 +176,6 @@ export default function OrdersPage() {
       setError(err instanceof Error ? err.message : "Failed to cancel order");
     }
   };
-
   // Filter orders by status only (search is now handled by the API)
   const filteredOrders = orders.filter((order) => {
     if (statusFilter !== "all" && order.status !== statusFilter) return false;
@@ -201,7 +184,7 @@ export default function OrdersPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <h1 className="text-3xl font-bold">Orders</h1>
         <div className="flex items-center gap-4">
           <div className="text-sm text-muted-foreground">

@@ -332,9 +332,18 @@ class TestOrderRetrieval:
 
         assert response.status_code == 200
         data = json.loads(response.data)
-        assert len(data) <= 3
-        assert all('order_id' in order for order in data)
-        assert all('status' in order for order in data)
+
+        # Ensure pagination metadata is present
+        assert data['page'] == 1
+        assert data['per_page'] == 3
+        assert data['total'] == 5
+        assert data['total_pages'] == 2
+
+        # Orders array should be paginated and contain required fields
+        orders = data['orders']
+        assert len(orders) <= 3
+        assert all('order_id' in order for order in orders)
+        assert all('status' in order for order in orders)
 
     def test_get_orders_missing_merchant_id(self, client):
         """Test getting orders without merchant_id."""

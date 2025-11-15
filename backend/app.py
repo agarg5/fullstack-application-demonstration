@@ -1,26 +1,48 @@
 import os
 import sqlite3
 import threading
-import random
-import time
 from datetime import datetime, timedelta, time as dt_time
 from functools import wraps
 
 import jwt
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO
 from werkzeug.security import check_password_hash, generate_password_hash
+
+import db
+from db import DATABASE_PATH as DB_DATABASE_PATH
+from orders_service import (
+    validate_order_times,
+    find_available_driver,
+    assign_driver_to_order,
+)
+from websocket_service import register_socketio_handlers, start_location_updates
 
 app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Database configuration
-# Default to ../data/database.db relative to backend folder
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATABASE_PATH = os.getenv('DATABASE_PATH', os.path.join(
-    SCRIPT_DIR, '..', 'data', 'database.db'))
+# Database path is defined in db.py but re-exported here so tests can
+# monkeypatch app.DATABASE_PATH and have it affect all DB access.
+DATABASE_PATH = DB_DATABASE_PATH
+
+
+def get_db_connection():
+    """Create a database connection using the current DATABASE_PATH.
+
+    Tests patch app.DATABASE_PATH; keep db.DATABASE_PATH in sync so all
+    helpers use the same database file.
+    """
+    db.DATABASE_PATH = DATABASE_PATH
+    return db.get_db_connection()
+
+
+def init_db():
+    """Initialize the database using the current DATABASE_PATH."""
+    db.DATABASE_PATH = DATABASE_PATH
+    return db.init_db()
+
 
 # JWT configuration (simple symmetric HS256 token)
 JWT_SECRET = os.getenv('JWT_SECRET', 'dev-secret-key-change-me')
@@ -30,126 +52,6 @@ JWT_EXPIRATION_MINUTES = int(os.getenv('JWT_EXPIRATION_MINUTES', '60'))
 # Lock for order updates (to prevent race conditions)
 order_locks = {}
 lock_manager = threading.Lock()
-
-
-def get_db_connection():
-    """Create a database connection."""
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    """Initialize the database with all required tables."""
-    conn = get_db_connection()
-
-    # Merchants table
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS merchants (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            email TEXT NOT NULL UNIQUE,
-            password_hash TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    # Drivers table
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS drivers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    # Vehicles table
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS vehicles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            driver_id INTEGER NOT NULL,
-            max_orders INTEGER NOT NULL,
-            max_weight REAL NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (driver_id) REFERENCES drivers(id) ON DELETE CASCADE,
-            UNIQUE(driver_id)
-        )
-    ''')
-
-    # Shifts table
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS shifts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            driver_id INTEGER NOT NULL,
-            shift_date DATE NOT NULL,
-            start_time TIME NOT NULL,
-            end_time TIME NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (driver_id) REFERENCES drivers(id) ON DELETE CASCADE,
-            UNIQUE(driver_id, shift_date)
-        )
-    ''')
-
-    # Orders table - add description field
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            merchant_id INTEGER NOT NULL,
-            driver_id INTEGER,
-            vehicle_id INTEGER,
-            status TEXT NOT NULL DEFAULT 'pending',
-            description TEXT,
-            pickup_time TIMESTAMP NOT NULL,
-            dropoff_time TIMESTAMP NOT NULL,
-            weight REAL NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (merchant_id) REFERENCES merchants(id) ON DELETE CASCADE,
-            FOREIGN KEY (driver_id) REFERENCES drivers(id) ON DELETE SET NULL,
-            FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE SET NULL,
-            CHECK(status IN ('pending', 'assigned', 'completed', 'cancelled'))
-        )
-    ''')
-
-    # Add description column if it doesn't exist (for existing databases)
-    try:
-        conn.execute('ALTER TABLE orders ADD COLUMN description TEXT')
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-
-    # Add password_hash to merchants if it doesn't exist (for existing databases)
-    try:
-        conn.execute('ALTER TABLE merchants ADD COLUMN password_hash TEXT')
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-
-    conn.commit()
-    conn.close()
-
-
-def validate_order_times(pickup_time_str, dropoff_time_str):
-    """Validate order pickup and dropoff times."""
-    try:
-        pickup_time = datetime.fromisoformat(
-            pickup_time_str.replace('Z', '+00:00'))
-        dropoff_time = datetime.fromisoformat(
-            dropoff_time_str.replace('Z', '+00:00'))
-    except (ValueError, AttributeError):
-        return False, "Invalid datetime format. Use ISO format (YYYY-MM-DDTHH:MM:SS)"
-
-    # Check if both are on the same day
-    if pickup_time.date() != dropoff_time.date():
-        return False, "Pickup and dropoff must be on the same day"
-
-    # Check if pickup is at least 15 minutes before dropoff
-    time_diff = dropoff_time - pickup_time
-    if time_diff < timedelta(minutes=15):
-        return False, "Pickup time must be at least 15 minutes before dropoff time"
-
-    # Check if dropoff is at most 4 hours after pickup
-    if time_diff > timedelta(hours=4):
-        return False, "Dropoff time must be at most 4 hours after pickup time"
-
-    return True, None
 
 
 def create_access_token(merchant_row):
@@ -167,115 +69,6 @@ def create_access_token(merchant_row):
     if isinstance(token, bytes):
         token = token.decode('utf-8')
     return token
-
-
-def find_available_driver(conn, pickup_time_str, dropoff_time_str, weight, exclude_driver_id=None):
-    """Find an available driver + vehicle for a new or updated order.
-
-    Assignment rules / assumptions:
-    - A driver is eligible only if they have a shift whose (date, start_time, end_time)
-      fully covers the order's pickup and dropoff time window.
-    - Each driver has exactly one vehicle; we enforce the vehicle's:
-      * max_weight: the order's weight must be <= max_weight
-      * max_orders: maximum number of *overlapping* orders that vehicle can carry.
-        We consider orders overlapping if:
-          existing.pickup_time < new.dropoff_time AND
-          existing.dropoff_time > new.pickup_time
-      Only orders with status IN ('assigned', 'completed') are counted, since they
-      represent work that has been or will be performed.
-    - The algorithm is greedy: it returns the first driver that satisfies all
-      constraints, based on the ordering of shifts returned by SQLite.
-    - When exclude_driver_id is provided, that driver is skipped entirely. This is
-      used by the update path when the old driver is known to no longer fit.
-    """
-    try:
-        pickup_time = datetime.fromisoformat(
-            pickup_time_str.replace('Z', '+00:00'))
-        dropoff_time = datetime.fromisoformat(
-            dropoff_time_str.replace('Z', '+00:00'))
-    except (ValueError, AttributeError):
-        return None, None
-
-    order_date = pickup_time.date()
-    pickup_time_only = pickup_time.time()
-    dropoff_time_only = dropoff_time.time()
-
-    # Find drivers with shifts on the order date
-    shifts = conn.execute('''
-        SELECT s.*, d.id as driver_id, d.name as driver_name, v.id as vehicle_id,
-               v.max_orders, v.max_weight
-        FROM shifts s
-        JOIN drivers d ON s.driver_id = d.id
-        JOIN vehicles v ON v.driver_id = d.id
-        WHERE s.shift_date = ?
-        AND s.start_time <= ?
-        AND s.end_time >= ?
-    ''', (order_date.isoformat(), pickup_time_only.strftime('%H:%M:%S'),
-          dropoff_time_only.strftime('%H:%M:%S'))).fetchall()
-
-    for shift in shifts:
-        driver_id = shift['driver_id']
-        vehicle_id = shift['vehicle_id']
-        max_orders = shift['max_orders']
-        max_weight = shift['max_weight']
-
-        # Skip if this is the excluded driver (for re-assignment checks)
-        if exclude_driver_id and driver_id == exclude_driver_id:
-            continue
-
-        # Check vehicle weight capacity
-        if weight > max_weight:
-            continue
-
-        # Count current assigned orders for this vehicle on the same day
-        # that overlap with the order time window.
-        # Two orders overlap if: (start1 < end2) AND (end1 > start2).
-        # This effectively limits the number of concurrent orders a vehicle
-        # can handle during any time window.
-        overlapping_orders = conn.execute('''
-            SELECT COUNT(*) as count
-            FROM orders
-            WHERE vehicle_id = ?
-            AND status IN ('assigned', 'completed')
-            AND DATE(pickup_time) = ?
-            AND pickup_time < ? AND dropoff_time > ?
-        ''', (vehicle_id, order_date.isoformat(),
-              dropoff_time_str, pickup_time_str)).fetchone()
-
-        current_order_count = overlapping_orders['count'] if overlapping_orders else 0
-
-        # Check if vehicle has capacity
-        if current_order_count >= max_orders:
-            continue
-
-        # Driver and vehicle are available!
-        return driver_id, vehicle_id
-
-    return None, None
-
-
-def assign_driver_to_order(conn, order_id, pickup_time, dropoff_time, weight, exclude_driver_id=None):
-    """Assign a driver to an order if possible."""
-    driver_id, vehicle_id = find_available_driver(
-        conn, pickup_time, dropoff_time, weight, exclude_driver_id)
-
-    if driver_id and vehicle_id:
-        conn.execute('''
-            UPDATE orders
-            SET driver_id = ?, vehicle_id = ?, status = 'assigned'
-            WHERE id = ?
-        ''', (driver_id, vehicle_id, order_id))
-        conn.commit()
-        return driver_id, vehicle_id
-    else:
-        # No driver available, set to pending
-        conn.execute('''
-            UPDATE orders
-            SET driver_id = NULL, vehicle_id = NULL, status = 'pending'
-            WHERE id = ?
-        ''', (order_id,))
-        conn.commit()
-        return None, None
 
 
 # ==================== DRIVERS ====================
@@ -319,6 +112,105 @@ def get_shifts():
     ''').fetchall()
     conn.close()
     return jsonify([dict(shift) for shift in shifts])
+
+
+@app.route('/drivers', methods=['POST'])
+def create_driver():
+    """Create a new driver."""
+    data = request.get_json() or {}
+    name = data.get('name')
+
+    if not name:
+        return jsonify({"error": "Name is required"}), 400
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute(
+            'INSERT INTO drivers (name) VALUES (?)',
+            (name,)
+        )
+        conn.commit()
+        driver_id = cursor.lastrowid
+        driver = conn.execute(
+            'SELECT * FROM drivers WHERE id = ?', (driver_id,)).fetchone()
+        conn.close()
+        return jsonify(dict(driver)), 201
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({"error": "Driver with this name already exists"}), 400
+
+
+@app.route('/vehicles', methods=['POST'])
+def create_vehicle():
+    """Create a new vehicle."""
+    data = request.get_json() or {}
+    driver_id = data.get('driver_id')
+    max_orders = data.get('max_orders')
+    max_weight = data.get('max_weight')
+
+    if not all([driver_id, max_orders, max_weight]):
+        return jsonify({"error": "driver_id, max_orders, and max_weight are required"}), 400
+
+    conn = get_db_connection()
+
+    # Ensure driver exists
+    driver = conn.execute(
+        'SELECT * FROM drivers WHERE id = ?', (driver_id,)).fetchone()
+    if not driver:
+        conn.close()
+        return jsonify({"error": "Driver not found"}), 404
+
+    try:
+        cursor = conn.execute(
+            'INSERT INTO vehicles (driver_id, max_orders, max_weight) VALUES (?, ?, ?)',
+            (driver_id, max_orders, max_weight)
+        )
+        conn.commit()
+        vehicle_id = cursor.lastrowid
+        vehicle = conn.execute(
+            'SELECT * FROM vehicles WHERE id = ?', (vehicle_id,)).fetchone()
+        conn.close()
+        return jsonify(dict(vehicle)), 201
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({"error": "Vehicle for this driver already exists"}), 400
+
+
+@app.route('/shifts', methods=['POST'])
+def create_shift():
+    """Create a new shift for a driver."""
+    data = request.get_json() or {}
+    driver_id = data.get('driver_id')
+    shift_date = data.get('shift_date')
+    start_time = data.get('start_time')
+    end_time = data.get('end_time')
+
+    if not all([driver_id, shift_date, start_time, end_time]):
+        return jsonify({"error": "driver_id, shift_date, start_time, and end_time are required"}), 400
+
+    conn = get_db_connection()
+
+    # Ensure driver exists
+    driver = conn.execute(
+        'SELECT * FROM drivers WHERE id = ?', (driver_id,)).fetchone()
+    if not driver:
+        conn.close()
+        return jsonify({"error": "Driver not found"}), 404
+
+    try:
+        cursor = conn.execute(
+            'INSERT INTO shifts (driver_id, shift_date, start_time, end_time) VALUES (?, ?, ?, ?)',
+            (driver_id, shift_date, start_time, end_time)
+        )
+        conn.commit()
+        shift_id = cursor.lastrowid
+        shift = conn.execute(
+            'SELECT * FROM shifts WHERE id = ?', (shift_id,)).fetchone()
+        conn.close()
+        return jsonify(dict(shift)), 201
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({"error": "Shift for this driver and date already exists"}), 400
 
 
 # ==================== ORDERS ====================
@@ -389,12 +281,16 @@ def get_orders():
             }
         formatted_orders.append(formatted_order)
 
+    # Calculate total pages for pagination metadata
+    total_pages = (total + per_page - 1) // per_page if per_page else 1
+
+    # Return a structured response with pagination info
     return jsonify({
         'orders': formatted_orders,
         'total': total,
         'page': page,
         'per_page': per_page,
-        'total_pages': (total + per_page - 1) // per_page
+        'total_pages': total_pages,
     })
 
 
@@ -901,54 +797,9 @@ def create_merchant():
 
 # ==================== WEBSOCKET TRACKING ====================
 
-def generate_fake_location():
-    """Generate fake driver locations for tracking."""
-    conn = get_db_connection()
-    drivers = conn.execute('SELECT id, name FROM drivers').fetchall()
-    conn.close()
-
-    if not drivers:
-        return
-
-    # Generate fake locations for each driver
-    for driver in drivers:
-        # Random location around NYC area
-        latitude = 40.7128 + random.uniform(-0.1, 0.1)
-        longitude = -74.0060 + random.uniform(-0.1, 0.1)
-
-        location_update = {
-            'driver_id': driver['id'],
-            'driver_name': driver['name'],
-            'latitude': round(latitude, 6),
-            'longitude': round(longitude, 6),
-            'timestamp': datetime.now().isoformat()
-        }
-
-        socketio.emit('location_update', location_update)
-
-
-@socketio.on('connect')
-def handle_connect():
-    """Handle WebSocket connection."""
-    print('Client connected to WebSocket')
-    emit('connected', {'message': 'Connected to tracking server'})
-
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    """Handle WebSocket disconnection."""
-    print('Client disconnected from WebSocket')
-
-
-def start_location_updates():
-    """Start sending fake location updates every few seconds."""
-    def send_updates():
-        while True:
-            generate_fake_location()
-            time.sleep(5)  # Send updates every 5 seconds
-
-    thread = threading.Thread(target=send_updates, daemon=True)
-    thread.start()
+# WebSocket handlers and background tracking live in websocket_service.py.
+# Here we simply register them against this SocketIO instance.
+register_socketio_handlers(socketio)
 
 
 if __name__ == '__main__':
@@ -957,7 +808,7 @@ if __name__ == '__main__':
     print(f"Database initialized at: {DATABASE_PATH}")
 
     # Start fake location updates
-    start_location_updates()
+    start_location_updates(socketio)
     print("Location tracking started (sending updates every 5 seconds)")
 
     # Run the Flask app with SocketIO
