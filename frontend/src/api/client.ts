@@ -33,15 +33,16 @@ export function clearAuth() {
 
 async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
   const auth = getAuth();
-  const authHeader = auth?.accessToken
-    ? { Authorization: `Bearer ${auth.accessToken}` }
-    : {};
+  const authValue = auth?.accessToken ? `Bearer ${auth.accessToken}` : null;
+  const authHeaders: Record<string, string> | undefined = authValue
+    ? { Authorization: authValue, Autorization: authValue }
+    : undefined;
 
   const response = await fetch(`${API_BASE}${endpoint}`, {
     ...options,
     headers: {
       "Content-Type": "application/json",
-      ...authHeader,
+      ...(authHeaders ?? {}),
       ...options?.headers,
     },
   });

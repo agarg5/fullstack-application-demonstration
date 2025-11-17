@@ -57,7 +57,7 @@ export default function DriversPage() {
       const shiftStart = parseISO(`${shift.shift_date}T${shift.start_time}`);
       const shiftEnd = parseISO(`${shift.shift_date}T${shift.end_time}`);
 
-      const ordersInShift = allOrders.filter((order) => {
+      const ordersInShift = allOrders.orders.filter((order) => {
         if (order.driver_id !== shift.driver_id) return false;
         const orderPickup = parseISO(order.pickup_time);
         return (

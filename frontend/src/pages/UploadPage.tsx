@@ -96,7 +96,9 @@ export default function UploadPage() {
           </div>
 
           <div className="space-y-2">
-            <label className="text-sm font-medium">CSV File</label>
+            <label className="text-sm font-medium" htmlFor="file-input">
+              CSV File
+            </label>
             <Input
               id="file-input"
               type="file"
