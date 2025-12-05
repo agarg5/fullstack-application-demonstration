@@ -25,7 +25,7 @@ ENV DATABASE_PATH=/app/data/database.db
 
 # Expose port (adjust as needed)
 EXPOSE 8000
-EXPOSE 5173
+EXPOSE 3000
 
 # Run the application
 COPY start.sh .
